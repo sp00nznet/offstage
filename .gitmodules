@@ -1,0 +1,3 @@
+[submodule "driver/SudoVDA"]
+	path = driver/SudoVDA
+	url = https://github.com/SudoMaker/SudoVDA
