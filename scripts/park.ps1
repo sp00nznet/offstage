@@ -4,7 +4,7 @@
 # Security: this leaves the console unlocked while nobody is at it. See docs/rdp.md.
 Start-Sleep -Seconds 2
 foreach ($line in (query session)) {
-    # A disconnected user session has no session name: "   ned   1  Disc". Session 0 is services.
+    # A disconnected user session has no session name: "   user   1  Disc". Session 0 is services.
     if ($line -match '\s(\d+)\s+Disc\s*$' -and $Matches[1] -ne '0') {
         tscon $Matches[1] /dest:console
     }

@@ -25,7 +25,7 @@ Rust 1.85+, ffmpeg 7+ with `ffplay` on PATH (`winget install Gyan.FFmpeg`), and 
 
 1. Clone with the driver submodule:
    ```
-   git clone --recurse-submodules <repo> offstage
+   git clone --recurse-submodules https://github.com/sp00nznet/offstage
    cd offstage
    ```
 2. Build and sign the virtual display driver. No admin needed. The first run downloads about
