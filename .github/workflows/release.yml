@@ -28,11 +28,18 @@ jobs:
         # Windows PowerShell: only its certificate provider has Remove-Item -DeleteKey.
         shell: powershell
         run: |
-          $c = Get-ChildItem Cert:\CurrentUser\My | ? Subject -eq "CN=$env:OFFSTAGE_SIGNER"
-          if (-not $c) { throw 'signing cert not found' }
-          "THUMBPRINT=$($c.Thumbprint)" >> $env:GITHUB_ENV
-          $c | Remove-Item -DeleteKey
-          if (Get-ChildItem Cert:\CurrentUser\My | ? Subject -eq "CN=$env:OFFSTAGE_SIGNER") { throw 'key still present' }
+          $c = @(Get-ChildItem Cert:\CurrentUser\My | ? Subject -eq "CN=$env:OFFSTAGE_SIGNER")
+          if ($c.Count -ne 1) { throw "expected one signing cert, found $($c.Count)" }
+          $t = $c[0].Thumbprint
+          $keyFile = "$env:APPDATA\Microsoft\Crypto\Keys\" + [Security.Cryptography.X509Certificates.RSACertificateExtensions]::GetRSAPrivateKey($c[0]).Key.UniqueName
+          if (-not (Test-Path $keyFile)) { throw "private key file not where expected: $keyFile" }
+          # -DeleteKey only binds with an explicit Cert:\ path, not a piped cert.
+          Remove-Item -Path "Cert:\CurrentUser\My\$t" -DeleteKey
+          if (Test-Path "Cert:\CurrentUser\My\$t") { throw 'cert still present' }
+          if (Test-Path $keyFile) { throw 'private key file still present' }
+          "Deleted cert $t and private key file $keyFile"
+          # AppendAllText writes UTF-8; Windows PowerShell's >> would write UTF-16, which Actions can't read.
+          [IO.File]::AppendAllText($env:GITHUB_ENV, "THUMBPRINT=$t`n")
       - name: Package
         shell: pwsh
         run: |
