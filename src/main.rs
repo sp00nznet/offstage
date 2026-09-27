@@ -155,6 +155,25 @@ struct Monitor<'a> {
     mode: (u32, u32, u32),
 }
 
+/// Asks the driver for monitor `guid` (plugging it in unless it already exists) and waits for
+/// Windows to bring it up. Returns its GDI name and the driver's (adapter, target) for it.
+fn plug(vda: &vda::Vda, guid: GUID, (w, h, hz): (u32, u32, u32)) -> Result<(GdiName, vda::AddOut), String> {
+    let out = vda.add(guid, w, h, hz)?;
+    // Windows takes a moment to bring the monitor up; the driver needs pings meanwhile.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        if let Some(n) = display::gdi_name(out.adapter, out.target_id) {
+            return Ok((n, out));
+        }
+        if Instant::now() > deadline {
+            vda.remove(guid);
+            return Err("the monitor was added but never showed up in the display configuration".into());
+        }
+        vda.ping();
+        sleep(TICK);
+    }
+}
+
 impl<'a> Monitor<'a> {
     /// With a slot, reuses (and resizes) that pool monitor, plugging it in only if it isn't yet.
     fn add(vda: &'a vda::Vda, (w, h, hz): (u32, u32, u32), slot: Option<u32>) -> Result<Self, String> {
@@ -162,20 +181,7 @@ impl<'a> Monitor<'a> {
             Some(i) => slot_guid(i),
             None => GUID::new().map_err(|e| e.to_string())?,
         };
-        let out = vda.add(guid, w, h, hz)?;
-        // Windows takes a moment to bring the monitor up; the driver needs pings meanwhile.
-        let deadline = Instant::now() + Duration::from_secs(10);
-        let name = loop {
-            if let Some(n) = display::gdi_name(out.adapter, out.target_id) {
-                break n;
-            }
-            if Instant::now() > deadline {
-                vda.remove(guid);
-                return Err("the monitor was added but never showed up in the display configuration".into());
-            }
-            vda.ping();
-            sleep(TICK);
-        };
+        let (name, out) = plug(vda, guid, (w, h, hz))?;
         let mut m = Monitor {
             vda,
             guid,
@@ -185,8 +191,25 @@ impl<'a> Monitor<'a> {
             dxgi: None,
             mode: (w, h, hz),
         };
-        display::set_mode(&m.name, w, h, hz)?;
+        if let Err(e) = display::set_mode(&m.name, w, h, hz) {
+            if !m.pooled {
+                return Err(e);
+            }
+            // A SudoVDA monitor offers the driver's fixed size list plus the size it was plugged in
+            // at, so a pooled monitor lacks e.g. 1600x900. Replug this slot at the size wanted: one
+            // screen flash, and later runs on the slot then have the size too.
+            eprintln!("offstage: pool monitor has no {w}x{h} mode; replugging it at that size (screens flash once)");
+            vda.remove(guid);
+            let gone = Instant::now() + Duration::from_secs(5);
+            while display::gdi_name(out.adapter, out.target_id).is_some() && Instant::now() < gone {
+                vda.ping();
+                sleep(TICK);
+            }
+            m.name = plug(vda, guid, (w, h, hz))?.0;
+            display::set_mode(&m.name, w, h, hz)?;
+        }
         // The desktop extends onto the monitor after the path exists; wait for it at full size.
+        let deadline = Instant::now() + Duration::from_secs(10);
         let rect = loop {
             if let Some(r) =
                 display::rect(&m.name).filter(|r| (r.right - r.left, r.bottom - r.top) == (w as i32, h as i32))
@@ -266,7 +289,17 @@ struct Recorder {
     child: Option<Child>,
     started: Instant,
     quick_fails: u32,
+    /// When to try the next segment, after an interruption.
+    retry_at: Option<Instant>,
+    /// Why recording stopped for good, if it did. Reported as a failed run.
+    failed: Option<String>,
 }
+
+/// Restarts after an interruption are spaced out, because a display change can take a moment to
+/// settle and a restart during it fails again. Twenty quick failures in a row is ffmpeg itself
+/// failing, not the display.
+const RETRY_DELAY: Duration = Duration::from_millis(500);
+const MAX_QUICK_FAILS: u32 = 20;
 
 impl Recorder {
     fn start(file: &str, encoder: &str, mon: &Monitor) -> Result<Self, String> {
@@ -279,6 +312,8 @@ impl Recorder {
             child: None,
             started: Instant::now(),
             quick_fails: 0,
+            retry_at: None,
+            failed: None,
         };
         r.segment()?;
         Ok(r)
@@ -321,27 +356,41 @@ impl Recorder {
         Ok(())
     }
 
-    /// Called every tick: if ffmpeg has dropped out, start the next segment.
+    /// Called every tick: if ffmpeg has dropped out, schedule the next segment, and start it when due.
     fn tick(&mut self) {
+        if self.failed.is_some() {
+            return;
+        }
+        if let Some(at) = self.retry_at {
+            if Instant::now() < at {
+                return;
+            }
+            self.retry_at = None;
+            if let Err(e) = self.segment() {
+                self.interrupted(&e, true);
+            }
+            return;
+        }
         let Some(c) = self.child.as_mut() else { return };
-        if !matches!(c.try_wait(), Ok(Some(_))) {
+        if matches!(c.try_wait(), Ok(Some(_))) {
+            self.child = None;
+            let quick = self.started.elapsed() < Duration::from_secs(2);
+            self.interrupted("ffmpeg stopped capturing (usually a display change)", quick);
+        }
+    }
+
+    /// `quick`: the segment died soon after starting, or never started.
+    fn interrupted(&mut self, why: &str, quick: bool) {
+        self.quick_fails = if quick { self.quick_fails + 1 } else { 0 };
+        if self.quick_fails >= MAX_QUICK_FAILS {
+            eprintln!("offstage: {why}; gave up after {MAX_QUICK_FAILS} failed restarts");
+            self.failed = Some(format!("capture stopped early: {why}"));
             return;
         }
-        self.child = None;
-        // A segment that dies at once is ffmpeg failing, not a display change; don't spin on it.
-        self.quick_fails = if self.started.elapsed() < Duration::from_secs(2) {
-            self.quick_fails + 1
-        } else {
-            0
-        };
-        if self.quick_fails >= 5 {
-            eprintln!("offstage: ffmpeg keeps failing at start; recording stopped");
-            return;
+        if self.quick_fails == 0 {
+            eprintln!("offstage: {why}; continuing in a new segment");
         }
-        eprintln!("offstage: capture interrupted (a display changed); continuing in a new segment");
-        if let Err(e) = self.segment() {
-            eprintln!("offstage: {e}; recording stopped");
-        }
+        self.retry_at = Some(Instant::now() + RETRY_DELAY);
     }
 
     fn finish(mut self) -> Result<(), String> {
@@ -355,7 +404,7 @@ impl Recorder {
             .collect();
         let _ = std::fs::remove_file(&self.file);
         match parts[..] {
-            [] => return Err("no frames were recorded".into()),
+            [] => return Err(self.failed.unwrap_or_else(|| "no frames were recorded".into())),
             [one] => std::fs::rename(one, &self.file).map_err(|e| e.to_string())?,
             _ => {
                 let list = self.file.with_extension("parts.txt");
@@ -384,7 +433,10 @@ impl Recorder {
                 eprintln!("offstage: joined {} segments", parts.len());
             }
         }
-        Ok(())
+        match self.failed {
+            Some(why) => Err(format!("{why}; saved what was captured to {}", self.file.display())),
+            None => Ok(()),
+        }
     }
 }
 
@@ -489,7 +541,7 @@ fn run(args: &[String]) -> Result<u8, String> {
 
     let mut in_job = HashMap::new();
     let mut rect = mon.rect;
-    let code = loop {
+    let mut code = loop {
         vda.ping();
         // Resizing a pooled monitor to the left of this one moves this one.
         rect = display::rect(&mon.name).unwrap_or(rect);
@@ -509,7 +561,13 @@ fn run(args: &[String]) -> Result<u8, String> {
     if let Some(rec) = recorder {
         match rec.finish() {
             Ok(()) => eprintln!("offstage: recorded {}", record.unwrap_or_default()),
-            Err(e) => eprintln!("offstage: recording: {e}"),
+            Err(e) => {
+                eprintln!("offstage: recording failed: {e}");
+                // The program's own failure wins; otherwise a lost recording must not look like success.
+                if code == 0 {
+                    code = 3;
+                }
+            }
         }
     }
     if let Some(mut v) = viewer {
@@ -604,6 +662,10 @@ fn serve(args: &[String]) -> Result<u8, String> {
     Ok(0)
 }
 
+/// Kill-on-close job holding offstage and the program's process tree. Deliberately never closed by
+/// offstage: offstage is in the job too, so closing the handle kills offstage itself before
+/// its exit code is set, and every run then exits 0. Windows closes the handle once offstage has
+/// exited, and that still kills whatever the program left running.
 struct Job(HANDLE);
 
 impl Job {
@@ -681,14 +743,6 @@ impl Job {
         };
         unsafe {
             let _ = EnumWindows(Some(each), LPARAM(&mut ctx as *mut Ctx as isize));
-        }
-    }
-}
-
-impl Drop for Job {
-    fn drop(&mut self) {
-        unsafe {
-            let _ = CloseHandle(self.0);
         }
     }
 }
