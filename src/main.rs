@@ -3,6 +3,7 @@
 //! ddagrab, and the viewer is ffplay's gdigrab. docs/architecture.md has the whole flow.
 
 mod display;
+mod install;
 mod vda;
 
 use display::{GdiName, name_str};
@@ -36,6 +37,9 @@ const USAGE: &str = "usage:
       (default encoder h264_nvenc); --view shows it live in a normal window.
   offstage hold [--view] [--wait] WxH[@HZ] [WxH[@HZ]...]
       Add monitors and keep them until Ctrl+C.
+  offstage install-driver INF
+      Admin. Create the driver's device node and install INF on it; driver/install-driver.cmd
+      runs this after trusting the signing cert.
   Virtual monitors only work when this session is on the console, not over RDP. --wait queues
   until it is (for example after RDP disconnects with the park task installed; docs/rdp.md).";
 
@@ -60,6 +64,7 @@ fn main() -> ExitCode {
     let result = match args.first().map(String::as_str) {
         Some("run") => run(&args[1..]),
         Some("hold") => hold(&args[1..]),
+        Some("install-driver") if args.len() == 2 => install::install_driver(&args[1]),
         _ => Err(USAGE.into()),
     };
     match result {
