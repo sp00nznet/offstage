@@ -1,0 +1,71 @@
+# On a v* tag: build the driver and offstage from source, sign the driver with a key made for this
+# release only, delete the key, and publish the zip. Why a throwaway key: SECURITY.md.
+name: release
+on:
+  push:
+    tags: ['v*']
+permissions:
+  contents: write
+jobs:
+  release:
+    runs-on: windows-latest
+    env:
+      OFFSTAGE_SIGNER: offstage release ${{ github.ref_name }} CI throwaway key
+      PKG: offstage-${{ github.ref_name }}-windows-x64
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+      - name: Check the tag matches Cargo.toml
+        shell: bash
+        run: test "v$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)" = "${{ github.ref_name }}"
+      - run: cargo test
+      - run: cargo build --release
+      - name: Build and sign the driver
+        shell: cmd
+        run: driver\build-driver.cmd
+      - name: Delete the signing key
+        shell: pwsh
+        run: |
+          $c = Get-ChildItem Cert:\CurrentUser\My | ? Subject -eq "CN=$env:OFFSTAGE_SIGNER"
+          if (-not $c) { throw 'signing cert not found' }
+          "THUMBPRINT=$($c.Thumbprint)" >> $env:GITHUB_ENV
+          $c | Remove-Item -DeleteKey
+          if (Get-ChildItem Cert:\CurrentUser\My | ? Subject -eq "CN=$env:OFFSTAGE_SIGNER") { throw 'key still present' }
+      - name: Package
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory "$env:PKG\driver\out", "$env:PKG\scripts" | Out-Null
+          Copy-Item target\release\offstage.exe, README.md, LICENSE, SECURITY.md, CHANGELOG.md $env:PKG
+          Copy-Item docs $env:PKG -Recurse
+          Copy-Item driver\install-driver.cmd "$env:PKG\driver"
+          Copy-Item driver\out\* "$env:PKG\driver\out"
+          Copy-Item scripts\* "$env:PKG\scripts"
+          Compress-Archive $env:PKG "$env:PKG.zip"
+          (Get-FileHash "$env:PKG.zip").Hash | Set-Content "$env:PKG.zip.sha256"
+      - name: Release notes
+        shell: bash
+        run: |
+          v="${GITHUB_REF_NAME#v}"
+          {
+            awk -v h="## [$v]" 'index($0, h) == 1 {on=1; next} /^## \[/ {on=0} on' CHANGELOG.md
+            echo
+            echo "## About the driver signature"
+            echo
+            echo "CI built the SudoVDA driver in this zip from this tag's source and signed it with a key generated"
+            echo "for this release, then deleted the key (see the \"Delete the signing key\" step in the run log)."
+            echo "Installing trusts this certificate:"
+            echo
+            echo "- Subject: \`CN=${OFFSTAGE_SIGNER}\`"
+            echo "- Thumbprint: \`${THUMBPRINT}\`"
+            echo
+            echo "No one holds the key, so nothing else can ever be signed with it. You are still trusting that this"
+            echo "build did what [the workflow](https://github.com/${GITHUB_REPOSITORY}/blob/${GITHUB_REF_NAME}/.github/workflows/release.yml)"
+            echo "says. To trust only your own key instead, build from source: see Getting Started in the README."
+          } > notes.md
+          cat notes.md
+      - name: Publish
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" "$PKG.zip" "$PKG.zip.sha256" --title "offstage $GITHUB_REF_NAME" --notes-file notes.md

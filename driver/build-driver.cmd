@@ -12,6 +12,8 @@ set "PKG=%HERE%packages"
 set "OUT=%HERE%out"
 set "V=10.0.28000.2526"
 set "K=10.0.28000.0"
+rem CI names each release's throwaway key; locally this stays one reusable cert.
+if not defined OFFSTAGE_SIGNER set "OFFSTAGE_SIGNER=offstage local driver signing"
 
 if not exist "%SRC%\Driver.cpp" git -C "%HERE%.." submodule update --init || exit /b 1
 
@@ -54,11 +56,11 @@ popd
 rem Sign with a local cert. The private key stays non-exportable in this user's store;
 rem install-driver.cmd trusts only the public half (offstage.cer).
 powershell -NoProfile -Command ^
-  "$c = Get-ChildItem Cert:\CurrentUser\My | ? Subject -eq 'CN=offstage local driver signing' | select -First 1;" ^
-  "if (-not $c) { $c = New-SelfSignedCertificate -Subject 'CN=offstage local driver signing' -Type CodeSigningCert -CertStoreLocation Cert:\CurrentUser\My -KeyExportPolicy NonExportable -NotAfter (Get-Date).AddYears(5) };" ^
+  "$c = Get-ChildItem Cert:\CurrentUser\My | ? Subject -eq 'CN=%OFFSTAGE_SIGNER%' | select -First 1;" ^
+  "if (-not $c) { $c = New-SelfSignedCertificate -Subject 'CN=%OFFSTAGE_SIGNER%' -Type CodeSigningCert -CertStoreLocation Cert:\CurrentUser\My -KeyExportPolicy NonExportable -NotAfter (Get-Date).AddYears(5) };" ^
   "Export-Certificate -Cert $c -FilePath '%OUT%\offstage.cer' | Out-Null" || exit /b 1
 
-set SIGN="%PKG%\microsoft.windows.sdk.cpp\c\bin\%K%\x64\signtool.exe" sign /q /fd sha256 /n "offstage local driver signing" /s My
+set SIGN="%PKG%\microsoft.windows.sdk.cpp\c\bin\%K%\x64\signtool.exe" sign /q /fd sha256 /n "%OFFSTAGE_SIGNER%" /s My
 rem Sign the DLL before Inf2Cat: the catalog hashes the file as signed.
 %SIGN% "%OUT%\SudoVDA.dll" || exit /b 1
 "%PKG%\microsoft.windows.wdk.x64\c\bin\%K%\x86\Inf2Cat.exe" /driver:"%OUT%" /os:10_X64 /uselocaltime >nul || (echo Inf2Cat failed & exit /b 1)

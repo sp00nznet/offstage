@@ -20,35 +20,62 @@ window moved onto the virtual monitor, captured at the monitor's full size.
 
 ## Getting Started
 
+There are two ways in. Both install the same driver; they differ in whose key signed it.
+
+### Prebuilt release
+
+Prerequisites: Windows 10/11 x64, and ffmpeg 7+ with `ffplay` on PATH (`winget install Gyan.FFmpeg`).
+
+1. Download `offstage-<version>-windows-x64.zip` from
+   [Releases](https://github.com/sp00nznet/offstage/releases) and unzip it anywhere.
+2. **Read this before installing.** CI built the driver in the zip from this repo's source and
+   signed it with a key generated for that release alone, then discarded the key. Installing
+   makes your machine trust that release's certificate (its thumbprint is in the release notes).
+   Nobody holds the key any more, so nothing else can be signed with it. You are still trusting
+   that the CI build did what [the workflow](.github/workflows/release.yml) says. If you'd rather
+   trust only a key you made, build from source below. [SECURITY.md](SECURITY.md) lists everything
+   the install changes.
+3. From an **elevated** prompt, in the unzipped folder:
+   ```
+   driver\install-driver.cmd
+   ```
+   It ends with `Installed. Try: offstage hold 1920x1080`.
+4. Check it works:
+   ```
+   offstage hold --view 1920x1080
+   ```
+   This should print the new monitor (`\.\DISPLAYn 1920x1080@60 at (x, y), dxgi adapter a output o`)
+   and open a window showing it. Ctrl+C removes it.
+
+### From source, signed with your own key
+
 Prerequisites: Windows 10/11 x64, Visual Studio 2022 (or Build Tools) with the C++ workload,
-Rust 1.85+, ffmpeg 7+ with `ffplay` on PATH (`winget install Gyan.FFmpeg`), and git.
+Rust 1.85+, ffmpeg 7+ with `ffplay` on PATH, and git.
 
 1. Clone with the driver submodule:
    ```
    git clone --recurse-submodules https://github.com/sp00nznet/offstage
    cd offstage
    ```
-2. Build and sign the virtual display driver. No admin needed. The first run downloads about
-   1.2 GB of WDK/SDK NuGet packages into `driver\packages\`.
+2. Build and sign the driver. No admin needed. The first run downloads about 1.2 GB of WDK/SDK
+   NuGet packages into `driver\packages\`. The signing key it creates stays in your user
+   certificate store and can't be exported.
    ```
    driver\build-driver.cmd
    ```
    It ends with `Built and signed: ...\driver\out`.
-3. From an **elevated** prompt, install it. This trusts your local signing cert; read
-   [docs/driver.md](docs/driver.md) first.
-   ```
-   driver\install-driver.cmd
-   ```
-4. Build offstage:
+3. Build offstage:
    ```
    cargo build --release
    ```
-5. Check it works:
+4. From an **elevated** prompt, install the driver. This trusts your own signing cert; see
+   [docs/driver.md](docs/driver.md).
    ```
-   target\release\offstage hold --view 1920x1080
+   driver\install-driver.cmd
    ```
-   This should print the new monitor (`\\.\DISPLAYn 1920x1080@60 at (x, y), dxgi adapter a output o`)
-   and open a window showing it. Ctrl+C removes it.
+5. Check it works: `target\release\offstage hold --view 1920x1080`, as in step 4 above.
+
+Uninstall either way: `driver\install-driver.cmd uninstall` (elevated).
 
 ## Usage
 

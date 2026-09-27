@@ -46,8 +46,16 @@ root. The key never leaves this user's cert store, but code running as this user
 sign. If that matters on a given machine, remove the cert from `Cert:\CurrentUser\My` after
 installing and rebuild with a new one next time.
 
+### Release builds
+
+`.github/workflows/release.yml` runs the same `build-driver.cmd` on a fresh runner, with
+`OFFSTAGE_SIGNER` set to `offstage release <tag> CI throwaway key`. It records the thumbprint,
+deletes the cert and its private key (`Remove-Item -DeleteKey`), and fails if the key is still
+there. Only then does it package. So a release's cert can be trusted without trusting anyone
+to keep a key safe. What remains is trust in the CI run itself.
+
 `install-driver.cmd uninstall` removes the device, every `sudovda.inf` driver package (Apollo's
-too, since they share a hardware ID and can't coexist), and the trusted cert.
+too, since they share a hardware ID and can't coexist), and every `CN=offstage ...` cert it trusted.
 
 ## Settings
 

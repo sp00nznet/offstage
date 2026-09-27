@@ -12,7 +12,10 @@ running it.
 
 The consequences:
 
-- **The trusted cert.** Anything signed with your local key is trusted on this machine. The key
+- **Prebuilt release.** CI ran `build-driver.cmd` with a key made for that release, then deleted the
+  key before packaging (the "Delete the signing key" step in the release run). Installing trusts a
+  cert whose key no longer exists; its thumbprint is in the release notes.
+- **Building it yourself.** Anything signed with your local key is trusted on this machine. The key
   can't be exported, but any code running as your user can sign with it. Remove it from
   `Cert:\CurrentUser\My` after installing if that matters to you. Details: [docs/driver.md](docs/driver.md).
 - **The park task.** It leaves your session unlocked on the machine's own screens after every RDP
