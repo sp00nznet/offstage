@@ -4,6 +4,15 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Versioning: Se
 
 ## [Unreleased]
 
+### Added
+- `offstage serve`: keeps a pool of virtual monitors plugged in. `run` borrows and resizes one
+  instead of plugging its own, so Windows no longer blanks every screen on each run.
+- `scripts/install-serve-autostart.cmd`: starts `serve --detach` at logon (no admin).
+
+### Fixed
+- A recording no longer stops when another display changes mode, such as a concurrent run resizing
+  its monitor. It continues in a new segment, and the segments are joined at the end.
+
 ## [0.1.0] - 2026-09-27
 
 ### Added

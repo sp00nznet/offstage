@@ -9,32 +9,41 @@ mod vda;
 use display::{GdiName, name_str};
 use std::collections::HashMap;
 use std::io::Write;
+use std::path::PathBuf;
 use std::process::{Child, Command, ExitCode, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::sleep;
 use std::time::{Duration, Instant};
-use windows::Win32::Foundation::{CloseHandle, HANDLE, HWND, LPARAM, RECT, TRUE};
-use windows::Win32::System::Console::SetConsoleCtrlHandler;
+use windows::Win32::Foundation::{
+    CloseHandle, ERROR_ALREADY_EXISTS, GetLastError, HANDLE, HWND, LPARAM, RECT, TRUE, WAIT_ABANDONED, WAIT_OBJECT_0,
+};
+use windows::Win32::System::Console::{FreeConsole, SetConsoleCtrlHandler};
 use windows::Win32::System::JobObjects::{
     AssignProcessToJobObject, CreateJobObjectW, IsProcessInJob, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
     JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation, SetInformationJobObject,
 };
 use windows::Win32::System::RemoteDesktop::{ProcessIdToSessionId, WTSGetActiveConsoleSessionId};
 use windows::Win32::System::Threading::{
-    GetCurrentProcess, GetCurrentProcessId, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+    CreateMutexW, GetCurrentProcess, GetCurrentProcessId, OpenMutexW, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+    ReleaseMutex, SYNCHRONIZATION_SYNCHRONIZE, WaitForSingleObject,
 };
 use windows::Win32::UI::HiDpi::{DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, SetProcessDpiAwarenessContext};
 use windows::Win32::UI::WindowsAndMessaging::{
     EnumWindows, GetWindowRect, GetWindowThreadProcessId, IsWindowVisible, SWP_ASYNCWINDOWPOS, SWP_NOACTIVATE,
     SWP_NOSIZE, SWP_NOZORDER, SetWindowPos,
 };
-use windows::core::{BOOL, GUID};
+use windows::core::{BOOL, GUID, HSTRING};
 
 const USAGE: &str = "usage:
   offstage run [--size WxH[@HZ]] [--record FILE] [--encoder ENC] [--view] [--wait] -- PROGRAM [ARGS...]
-      Add a virtual monitor (default 1920x1080@60), run PROGRAM with its windows kept on it,
-      and remove the monitor when PROGRAM exits. --record captures the monitor with ffmpeg
-      (default encoder h264_nvenc); --view shows it live in a normal window.
+      Run PROGRAM on a virtual monitor (default 1920x1080@60) with its windows kept there.
+      --record captures the monitor with ffmpeg (default encoder h264_nvenc); --view shows it
+      live in a normal window. With `offstage serve` running, borrows and resizes a pooled monitor
+      (no screen flash); otherwise adds one and removes it when PROGRAM exits.
+  offstage serve [--slots N] [--detach]
+      Keep N pooled monitors (default 2) plugged in until stopped, so runs never plug or unplug
+      one. Plugging and unplugging makes Windows blank every screen; resizing doesn't. --detach
+      drops the console window (for starting at logon: scripts/install-serve-autostart.cmd).
   offstage hold [--view] [--wait] WxH[@HZ] [WxH[@HZ]...]
       Add monitors and keep them until Ctrl+C.
   offstage install-driver INF
@@ -64,6 +73,7 @@ fn main() -> ExitCode {
     let result = match args.first().map(String::as_str) {
         Some("run") => run(&args[1..]),
         Some("hold") => hold(&args[1..]),
+        Some("serve") => serve(&args[1..]),
         Some("install-driver") if args.len() == 2 => install::install_driver(&args[1]),
         _ => Err(USAGE.into()),
     };
@@ -92,10 +102,53 @@ fn parse_mode(s: &str) -> Result<(u32, u32, u32), String> {
     Ok((w, h, hz))
 }
 
-/// One live virtual monitor. Dropping it unplugs it.
+/// Pool slots `serve` and `run` share. The driver's default limit is 10 monitors.
+const MAX_SLOTS: u32 = 8;
+const SERVE_MUTEX: &str = r"Local\offstage-serve";
+
+/// Fixed per slot, so every process names the same monitor: adding a GUID the driver already
+/// has returns the existing monitor instead of plugging a new one.
+fn slot_guid(slot: u32) -> GUID {
+    GUID::from_u128(0x6f666673_7461_6765_736c_6f7400000000 + slot as u128)
+}
+
+/// A pool slot this process holds, so two runs never share a monitor. The mutex is released on
+/// drop, or abandoned if offstage dies, and claim_slot accepts abandoned ones.
+struct Slot(HANDLE);
+
+impl Drop for Slot {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = ReleaseMutex(self.0);
+            let _ = CloseHandle(self.0);
+        }
+    }
+}
+
+/// The first free pool slot, if `serve` is running. None means use a temporary monitor.
+fn claim_slot() -> Option<(u32, Slot)> {
+    unsafe {
+        let serve = OpenMutexW(SYNCHRONIZATION_SYNCHRONIZE, false, &HSTRING::from(SERVE_MUTEX)).ok()?;
+        let _ = CloseHandle(serve);
+        for i in 0..MAX_SLOTS {
+            let Ok(h) = CreateMutexW(None, false, &HSTRING::from(format!(r"Local\offstage-slot-{i}"))) else {
+                continue;
+            };
+            let w = WaitForSingleObject(h, 0);
+            if w == WAIT_OBJECT_0 || w == WAIT_ABANDONED {
+                return Some((i, Slot(h)));
+            }
+            let _ = CloseHandle(h);
+        }
+        None
+    }
+}
+
+/// One live virtual monitor. Dropping a temporary one unplugs it; a pooled one stays for the next run.
 struct Monitor<'a> {
     vda: &'a vda::Vda,
     guid: GUID,
+    pooled: bool,
     name: GdiName,
     rect: RECT,
     dxgi: Option<(u32, u32)>,
@@ -103,8 +156,12 @@ struct Monitor<'a> {
 }
 
 impl<'a> Monitor<'a> {
-    fn add(vda: &'a vda::Vda, (w, h, hz): (u32, u32, u32)) -> Result<Self, String> {
-        let guid = GUID::new().map_err(|e| e.to_string())?;
+    /// With a slot, reuses (and resizes) that pool monitor, plugging it in only if it isn't yet.
+    fn add(vda: &'a vda::Vda, (w, h, hz): (u32, u32, u32), slot: Option<u32>) -> Result<Self, String> {
+        let guid = match slot {
+            Some(i) => slot_guid(i),
+            None => GUID::new().map_err(|e| e.to_string())?,
+        };
         let out = vda.add(guid, w, h, hz)?;
         // Windows takes a moment to bring the monitor up; the driver needs pings meanwhile.
         let deadline = Instant::now() + Duration::from_secs(10);
@@ -122,6 +179,7 @@ impl<'a> Monitor<'a> {
         let mut m = Monitor {
             vda,
             guid,
+            pooled: slot.is_some(),
             name,
             rect: RECT::default(),
             dxgi: None,
@@ -193,39 +251,148 @@ impl<'a> Monitor<'a> {
             "ffplay",
         )
     }
+}
 
-    fn record(&self, file: &str, encoder: &str) -> Result<Child, String> {
-        let (a, o) = self
-            .dxgi
-            .ok_or("the monitor has no DXGI output, so ddagrab can't capture it")?;
-        let hz = self.mode.2;
+/// Records one monitor with ffmpeg ddagrab, in segments. Any display-mode change on the GPU (another
+/// run resizing its pooled monitor, a UAC prompt) ends every desktop duplication with
+/// DXGI_ERROR_ACCESS_LOST (887a0026) and ffmpeg exits. So the recorder starts a new segment, and
+/// joins the segments when stopped. A gap of a fraction of a second beats a truncated recording.
+struct Recorder {
+    file: PathBuf,
+    encoder: String,
+    hz: u32,
+    name: GdiName,
+    segments: Vec<PathBuf>,
+    child: Option<Child>,
+    started: Instant,
+    quick_fails: u32,
+}
+
+impl Recorder {
+    fn start(file: &str, encoder: &str, mon: &Monitor) -> Result<Self, String> {
+        let mut r = Recorder {
+            file: PathBuf::from(file),
+            encoder: encoder.into(),
+            hz: mon.mode.2,
+            name: mon.name,
+            segments: Vec::new(),
+            child: None,
+            started: Instant::now(),
+            quick_fails: 0,
+        };
+        r.segment()?;
+        Ok(r)
+    }
+
+    fn segment(&mut self) -> Result<(), String> {
+        // Looked up per segment: plugging or resizing another monitor can renumber outputs.
+        let (a, o) =
+            display::dxgi_index(&self.name).ok_or("the monitor has no DXGI output, so ddagrab can't capture it")?;
+        let path = self.file.with_extension(format!("part{}.mp4", self.segments.len()));
         // Hardware encoders take ddagrab's D3D11 frames directly; software ones need them in RAM.
-        let hw = ["_nvenc", "_amf", "_qsv"].iter().any(|s| encoder.ends_with(s));
+        let hw = ["_nvenc", "_amf", "_qsv"].iter().any(|s| self.encoder.ends_with(s));
         let graph = format!(
-            "ddagrab=output_idx={o}:framerate={hz}{}",
+            "ddagrab=output_idx={o}:framerate={}{}",
+            self.hz,
             if hw { "" } else { ",hwdownload,format=bgra" }
         );
         let mut c = Command::new("ffmpeg");
         c.args([
             "-hide_banner",
             "-loglevel",
-            "error",
+            "fatal",
             "-init_hw_device",
             &format!("d3d11va=dd:{a}"),
+        ])
+        .args([
             "-filter_hw_device",
             "dd",
-        ])
-        .args(["-filter_complex", &graph, "-c:v", encoder]);
+            "-filter_complex",
+            &graph,
+            "-c:v",
+            &self.encoder,
+        ]);
         if !hw {
             c.args(["-pix_fmt", "yuv420p"]);
         }
-        spawn(c.args(["-y", file]).stdin(Stdio::piped()), "ffmpeg")
+        self.child = Some(spawn(c.arg("-y").arg(&path).stdin(Stdio::piped()), "ffmpeg")?);
+        self.segments.push(path);
+        self.started = Instant::now();
+        Ok(())
+    }
+
+    /// Called every tick: if ffmpeg has dropped out, start the next segment.
+    fn tick(&mut self) {
+        let Some(c) = self.child.as_mut() else { return };
+        if !matches!(c.try_wait(), Ok(Some(_))) {
+            return;
+        }
+        self.child = None;
+        // A segment that dies at once is ffmpeg failing, not a display change; don't spin on it.
+        self.quick_fails = if self.started.elapsed() < Duration::from_secs(2) {
+            self.quick_fails + 1
+        } else {
+            0
+        };
+        if self.quick_fails >= 5 {
+            eprintln!("offstage: ffmpeg keeps failing at start; recording stopped");
+            return;
+        }
+        eprintln!("offstage: capture interrupted (a display changed); continuing in a new segment");
+        if let Err(e) = self.segment() {
+            eprintln!("offstage: {e}; recording stopped");
+        }
+    }
+
+    fn finish(mut self) -> Result<(), String> {
+        if let Some(c) = self.child.take() {
+            stop_recorder(c);
+        }
+        let parts: Vec<&PathBuf> = self
+            .segments
+            .iter()
+            .filter(|p| p.metadata().is_ok_and(|m| m.len() > 0))
+            .collect();
+        let _ = std::fs::remove_file(&self.file);
+        match parts[..] {
+            [] => return Err("no frames were recorded".into()),
+            [one] => std::fs::rename(one, &self.file).map_err(|e| e.to_string())?,
+            _ => {
+                let list = self.file.with_extension("parts.txt");
+                let lines: String = parts
+                    .iter()
+                    .map(|p| format!("file '{}'\n", p.display().to_string().replace('\'', r"'\''")))
+                    .collect();
+                std::fs::write(&list, lines).map_err(|e| e.to_string())?;
+                let ok = Command::new("ffmpeg")
+                    .args(["-hide_banner", "-loglevel", "error", "-f", "concat", "-safe", "0", "-i"])
+                    .arg(&list)
+                    .args(["-c", "copy", "-y"])
+                    .arg(&self.file)
+                    .status()
+                    .is_ok_and(|s| s.success());
+                if !ok {
+                    return Err(format!(
+                        "joining segments failed; they are kept, listed in {}",
+                        list.display()
+                    ));
+                }
+                let _ = std::fs::remove_file(&list);
+                for p in &self.segments {
+                    let _ = std::fs::remove_file(p);
+                }
+                eprintln!("offstage: joined {} segments", parts.len());
+            }
+        }
+        Ok(())
     }
 }
 
 impl Drop for Monitor<'_> {
     fn drop(&mut self) {
-        self.vda.remove(self.guid);
+        if !self.pooled {
+            self.vda.remove(self.guid);
+        }
     }
 }
 
@@ -297,10 +464,21 @@ fn run(args: &[String]) -> Result<u8, String> {
     unsafe { SetConsoleCtrlHandler(Some(on_ctrl), true).map_err(|e| e.to_string())? };
     console_gate(wait)?;
     let vda = vda::Vda::open()?;
-    let mon = Monitor::add(&vda, mode)?;
-    eprintln!("offstage: {}", mon.describe());
+    // Held to the end of run, so no other run takes this slot's monitor meanwhile.
+    let slot = claim_slot();
+    let mon = Monitor::add(&vda, mode, slot.as_ref().map(|(i, _)| *i))?;
+    match &slot {
+        Some((i, _)) => eprintln!("offstage: {} (pool slot {i})", mon.describe()),
+        None => eprintln!(
+            "offstage: {} (temporary; run `offstage serve` to avoid the screen flash)",
+            mon.describe()
+        ),
+    }
     let viewer = if view { Some(mon.view()?) } else { None };
-    let recorder = record.as_deref().map(|f| mon.record(f, &encoder)).transpose()?;
+    let mut recorder = record
+        .as_deref()
+        .map(|f| Recorder::start(f, &encoder, &mon))
+        .transpose()?;
 
     // The program goes in a job, so its windows can be told apart from everyone else's (including
     // grandchildren a launcher spawns), and the whole tree dies with offstage. offstage joins the
@@ -310,9 +488,15 @@ fn run(args: &[String]) -> Result<u8, String> {
     let mut child = spawn(Command::new(exe).args(exe_args), exe)?;
 
     let mut in_job = HashMap::new();
+    let mut rect = mon.rect;
     let code = loop {
         vda.ping();
-        job.sweep_windows(mon.rect, &mut in_job);
+        // Resizing a pooled monitor to the left of this one moves this one.
+        rect = display::rect(&mon.name).unwrap_or(rect);
+        job.sweep_windows(rect, &mut in_job);
+        if let Some(r) = recorder.as_mut() {
+            r.tick();
+        }
         if let Ok(Some(status)) = child.try_wait() {
             break status.code().unwrap_or(1) as u8;
         }
@@ -323,8 +507,10 @@ fn run(args: &[String]) -> Result<u8, String> {
     };
 
     if let Some(rec) = recorder {
-        stop_recorder(rec);
-        eprintln!("offstage: recorded {}", record.unwrap_or_default());
+        match rec.finish() {
+            Ok(()) => eprintln!("offstage: recorded {}", record.unwrap_or_default()),
+            Err(e) => eprintln!("offstage: recording: {e}"),
+        }
     }
     if let Some(mut v) = viewer {
         let _ = v.kill();
@@ -348,7 +534,7 @@ fn hold(args: &[String]) -> Result<u8, String> {
     let vda = vda::Vda::open()?;
     let mut mons = Vec::new();
     for m in modes {
-        let mon = Monitor::add(&vda, m)?;
+        let mon = Monitor::add(&vda, m, None)?;
         eprintln!("offstage: {}", mon.describe());
         mons.push(mon);
     }
@@ -365,6 +551,55 @@ fn hold(args: &[String]) -> Result<u8, String> {
     }
     for mut v in viewers {
         let _ = v.kill();
+    }
+    Ok(0)
+}
+
+fn serve(args: &[String]) -> Result<u8, String> {
+    let (mut slots, mut detach) = (2, false);
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        match a.as_str() {
+            "--slots" => {
+                slots = it
+                    .next()
+                    .and_then(|n| n.parse().ok())
+                    .filter(|n| (1..=MAX_SLOTS).contains(n))
+                    .ok_or(format!("--slots wants 1 to {MAX_SLOTS}"))?
+            }
+            "--detach" => detach = true,
+            _ => return Err(USAGE.into()),
+        }
+    }
+    unsafe { SetConsoleCtrlHandler(Some(on_ctrl), true).map_err(|e| e.to_string())? };
+    // Held for serve's lifetime; claim_slot looks for it to know the pool exists.
+    let keeper = unsafe { CreateMutexW(None, true, &HSTRING::from(SERVE_MUTEX)) }.map_err(|e| e.to_string())?;
+    if unsafe { GetLastError() } == ERROR_ALREADY_EXISTS {
+        return Err("serve is already running".into());
+    }
+    // Started at logon, the session may be RDP; the pool can only live on the console.
+    console_gate(true)?;
+    let vda = vda::Vda::open()?;
+    for i in 0..slots {
+        let mon = Monitor::add(&vda, (1920, 1080, 60), Some(i))?;
+        eprintln!("offstage: pool slot {i}: {}", mon.describe());
+    }
+    eprintln!("offstage: serving {slots} pooled monitor(s); Ctrl+C to stop");
+    if detach {
+        unsafe {
+            let _ = FreeConsole();
+        }
+    }
+    while !STOP.load(Ordering::SeqCst) {
+        vda.ping();
+        sleep(Duration::from_secs(1));
+    }
+    // Runs may have grown the pool past `slots`, so clear every slot.
+    for i in 0..MAX_SLOTS {
+        vda.remove(slot_guid(i));
+    }
+    unsafe {
+        let _ = CloseHandle(keeper);
     }
     Ok(0)
 }

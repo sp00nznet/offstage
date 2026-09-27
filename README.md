@@ -95,6 +95,16 @@ offstage hold --view 1920x1080 1920x1080 2560x1440
 ```
 Several monitors at once, each with its own viewer, until Ctrl+C.
 
+```
+offstage serve
+```
+Keeps a pool of monitors (default 2, `--slots N`) plugged in. Runs then borrow and resize one
+instead of plugging in their own. Plugging or unplugging a monitor makes Windows blank every screen
+for a moment; resizing one doesn't. So with agents launching test after test, `serve` means one
+flash at startup instead of two per run. `scripts\install-serve-autostart.cmd` starts it at logon
+(no admin). Several runs at once each get their own monitor. The recording survives other
+monitors resizing: see [docs/architecture.md](docs/architecture.md#recording-in-segments).
+
 Over RDP, virtual monitors can't reach your session. `--wait` queues the run until the session is
 back on the console. With the opt-in park task, that happens when you disconnect. See
 [docs/rdp.md](docs/rdp.md).
@@ -112,7 +122,8 @@ back on the console. With the opt-in park task, that happens when you disconnect
 ## Building from source
 
 Driver: `driver\build-driver.cmd`. Why it compiles with `cl`/`link` instead of MSBuild:
-[docs/driver.md](docs/driver.md). CLI: `cargo build --release`. Design:
+[docs/driver.md](docs/driver.md). CLI: `cargo build --release`. Stop `serve` and any runs first: Windows
+locks a running `offstage.exe`, and cargo fails with `Access is denied. (os error 5)`. Design:
 [docs/architecture.md](docs/architecture.md).
 
 ## License
