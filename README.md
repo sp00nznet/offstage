@@ -83,7 +83,8 @@ Uninstall either way: `driver\install-driver.cmd uninstall` (elevated).
 offstage run --size 2560x1440 --record run.mp4 -- mygame.exe --level 3
 ```
 Adds a 2560x1440 monitor, starts the game, and keeps every window its process tree opens on that
-monitor. It records until the game exits, then removes the monitor. The exit code is the game's.
+monitor. It records until the game exits, then removes the monitor. The exit code is the game's, or 3 if
+the game exited 0 but the recording was lost or incomplete.
 
 ```
 offstage run --size 3840x2160@120 --view -- build\recomp.exe

@@ -4,6 +4,20 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Versioning: Se
 
 ## [Unreleased]
 
+### Fixed
+- `run` always exited 0, whatever the program returned. Closing the kill-on-close job, which offstage
+  is in too, killed offstage before its exit code was set. It now exits with the program's code.
+- A lost or incomplete recording now fails the run with exit code 3 when the program itself
+  succeeded, instead of reporting success.
+- Restarting capture after a display change waits 500 ms between attempts and gives up after 20
+  quick failures. It used to give up after 5, which a burst of display changes could cause.
+- A pooled monitor now takes sizes outside SudoVDA's built-in list (e.g. 1600x900, 1440x900). The
+  slot is replugged at that size once, with one screen flash.
+
+### Changed
+- `scripts/install-serve-autostart.cmd` runs serve from a copy in `%LOCALAPPDATA%\offstage`, so a
+  running serve no longer blocks `cargo build --release`.
+
 ## [0.2.0] - 2026-09-27
 
 ### Added

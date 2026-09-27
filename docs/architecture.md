@@ -42,6 +42,12 @@ leaves it plugged in afterwards. `serve` holds `Local\offstage-serve` for as lon
 that tells runs the pool exists. With no free slot, or no `serve`, a run falls back to a temporary
 monitor and the flash that comes with it.
 
+A SudoVDA monitor only offers the driver's fixed size list (800x600, 1280x720, 1366x768,
+1920x1080, 2560x1440, 2880x1600, 3664x1920, 3840x2160, 4128x2208, 7320x3142), plus the size it
+was plugged in at. So a pool monitor plugged at 1920x1080 can't be set to 1600x900. When the
+resize fails, the run replugs that slot at the wanted size: one flash, and the slot keeps that
+size available afterwards.
+
 Resizing one pooled monitor moves the ones to its right, which is why the run loop re-reads its
 rectangle every tick.
 
@@ -58,6 +64,16 @@ That cut a concurrent run's recording at 27 frames. The recorder now starts a ne
 up the DXGI output again, since outputs can renumber) and joins the segments with ffmpeg's concat
 demuxer when the run ends. The same two-run test then gave one 9.0 s, 412-frame file with a
 single join.
+
+Restarts wait 500 ms, since a restart while the display is still changing fails again. Twenty
+failures within 2 s of starting, in a row, means ffmpeg itself is failing: recording stops, and the
+run exits 3 if the program succeeded.
+
+## Exit codes and the job
+
+offstage joins its own kill-on-close job. So it must never close the job handle itself: that
+kills offstage before its exit code is set, and the run exits 0 whatever happened. Windows closes
+the handle when offstage exits, which still kills whatever the program left running.
 
 ## Why these choices
 
