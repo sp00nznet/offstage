@@ -25,7 +25,8 @@ jobs:
         shell: cmd
         run: driver\build-driver.cmd
       - name: Delete the signing key
-        shell: pwsh
+        # Windows PowerShell: only its certificate provider has Remove-Item -DeleteKey.
+        shell: powershell
         run: |
           $c = Get-ChildItem Cert:\CurrentUser\My | ? Subject -eq "CN=$env:OFFSTAGE_SIGNER"
           if (-not $c) { throw 'signing cert not found' }
