@@ -4,6 +4,8 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Versioning: Se
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-09-27
+
 ### Added
 - `offstage serve`: keeps a pool of virtual monitors plugged in. `run` borrows and resizes one
   instead of plugging its own, so Windows no longer blanks every screen on each run.
